@@ -1,0 +1,10 @@
+apiVersion: v2
+name: alloy-logs
+description: Wrapper chart to deploy Grafana Alloy (upstream) for Kubernetes logs -> Loki
+type: application
+version: 0.1.0
+
+dependencies:
+  - name: alloy
+    repository: https://grafana.github.io/helm-charts
+    version: "1.5.1"
