@@ -1,0 +1,139 @@
+alloy:
+  # Persist offsets/state so restarts don't replay logs
+  storagePath: /var/lib/alloy
+
+  # Create configmap from this content
+  configMap:
+    create: true
+    content: |-
+      logging {
+        level = "info"
+      }
+
+      // --- Loki output (matches promtail client.url + tls_config.insecure_skip_verify)
+      loki.write "default" {
+        endpoint {
+          url = "https://loki-gateway.xx.xx/loki/api/v1/push"
+
+          tls_config {
+            insecure_skip_verify = true
+          }
+        }
+      }
+
+      // --- Discover pods
+      discovery.kubernetes "pods" {
+        role = "pod"
+      }
+
+      // --- Read pod logs and forward to pipeline
+      // Uses k8s metadata; chart mounts must provide log files
+      loki.source.kubernetes "pods" {
+        targets    = discovery.kubernetes.pods.targets
+        forward_to = [loki.process.pipeline.receiver]
+      }
+
+      // --- Processing pipeline (promtail pipeline_stages + relabels)
+      loki.process "pipeline" {
+        // Drop kube-system (same as your promtail match drop)
+        stage.match {
+          selector = `{namespace="kube-system"}`
+          action   = "drop"
+        }
+
+        // ---------- High-volume namespace tuning example ----------
+        // Keep ingress-nginx but drop low-value noise early
+        stage.match {
+          selector = `{namespace="ingress-nginx"}`
+          action   = "keep"
+
+          stages = [
+            // drop common probe / health noise
+            {
+              drop = {
+                expression = ".*kube-probe.*|.*GET /health.*|.*GET /ready.*|.*GET /live.*|.*GET /metrics.*"
+              }
+            }
+          ]
+        }
+        // --------------------------------------------------------
+
+        // Parse CRI format
+        stage.cri {}
+
+        // Parse JSON fields (matches your promtail json.expressions)
+        stage.json {
+          expressions = {
+            level     = "level"
+            logger    = "logger"
+            mdc       = "mdc"
+            message   = "message"
+            thread    = "thread"
+            timestamp = "timestamp"
+          }
+        }
+
+        // Optionally drop INFO for a high-volume namespace (example)
+        stage.match {
+          selector = `{namespace="ingress-nginx", level="INFO"}`
+          action   = "drop"
+        }
+
+        // Labels (equivalent to your relabel_configs for app/instance/component/etc)
+        stage.labels {
+          values = {
+            app       = "{{ .__meta_kubernetes_pod_label_app_kubernetes_io_name | default .__meta_kubernetes_pod_label_app | default .__meta_kubernetes_pod_name }}"
+            instance  = "{{ .__meta_kubernetes_pod_label_app_kubernetes_io_instance | default .__meta_kubernetes_pod_label_instance }}"
+            component = "{{ .__meta_kubernetes_pod_label_app_kubernetes_io_component | default .__meta_kubernetes_pod_label_component }}"
+            namespace = "{{ .__meta_kubernetes_namespace }}"
+            pod       = "{{ .__meta_kubernetes_pod_name }}"
+            container = "{{ .__meta_kubernetes_pod_container_name }}"
+          }
+        }
+
+        // job = namespace/app (same idea as your relabel separator "/" to build job)
+        stage.template {
+          source   = "job"
+          template = "{{ .namespace }}/{{ .app }}"
+        }
+
+        forward_to = [loki.write.default.receiver]
+      }
+
+# DaemonSet (default, but make it explicit)
+controller:
+  type: daemonset
+
+# Required mounts for k8s log collection
+mounts:
+  varlog: true
+  # Enable dockercontainers only if you're actually on Docker runtime.
+  dockercontainers: false
+
+  # Add our persistent data dir
+  extra:
+    - name: alloy-data
+      mountPath: /var/lib/alloy
+
+# Node-local persistent storage for positions/state (scales linearly per node)
+volumes:
+  extra:
+    - name: alloy-data
+      hostPath:
+        path: /var/lib/alloy
+        type: DirectoryOrCreate
+
+# Reasonable defaults for busy clusters; adjust if needed
+alloy:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 200Mi
+    limits:
+      memory: 800Mi
+
+# keep RBAC + SA on (needed for discovery + loki.source.kubernetes)
+rbac:
+  create: true
+serviceAccount:
+  create: true
