@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-logs-config
+  labels:
+    app.kubernetes.io/name: alloy
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  config.river: |-
+    logging {
+      level = "info"
+    }
+
+    // -------------------------
+    // Loki output
+    // -------------------------
+    loki.write "default" {
+      endpoint {
+        url = "https://loki-gateway.xx.xx/loki/api/v1/push"
+
+        tls_config {
+          insecure_skip_verify = true
+        }
+      }
+    }
+
+    // -------------------------
+    // Kubernetes discovery
+    // -------------------------
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    // -------------------------
+    // Source: pod logs
+    // -------------------------
+    loki.source.kubernetes "pods" {
+      targets    = discovery.kubernetes.pods.targets
+      forward_to = [loki.process.pipeline.receiver]
+    }
+
+    // -------------------------
+    // Processing pipeline (TEST MODE)
+    // -------------------------
+    loki.process "pipeline" {
+
+      // ✅ KEEP only selected kube-system components
+      stage.match {
+        selector = `{namespace="kube-system", app=~"coredns|kube-apiserver"}`
+        action   = "keep"
+      }
+
+      // ❌ DROP other kube-system pods
+      stage.match {
+        selector = `{namespace="kube-system", app!~"coredns|kube-apiserver"}`
+        action   = "drop"
+      }
+
+      // ❌ DROP everything outside kube-system
+      stage.match {
+        selector = `{namespace!="kube-system"}`
+        action   = "drop"
+      }
+
+      // Parse CRI logs
+      stage.cri {}
+
+      // Parse JSON if present
+      stage.json {
+        expressions = {
+          level     = "level"
+          logger    = "logger"
+          message   = "message"
+          timestamp = "timestamp"
+        }
+      }
+
+      // Labels (Promtail-compatible)
+      stage.labels {
+        values = {
+          app       = "{{ .__meta_kubernetes_pod_label_k8s_app | default .__meta_kubernetes_pod_label_app | default .__meta_kubernetes_pod_name }}"
+          namespace = "{{ .__meta_kubernetes_namespace }}"
+          pod       = "{{ .__meta_kubernetes_pod_name }}"
+          container = "{{ .__meta_kubernetes_pod_container_name }}"
+        }
+      }
+
+      // job = namespace/app
+      stage.template {
+        source   = "job"
+        template = "{{ .namespace }}/{{ .app }}"
+      }
+
+      forward_to = [loki.write.default.receiver]
+    }
