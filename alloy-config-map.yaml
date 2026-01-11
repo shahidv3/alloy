@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-logs-config
+  labels:
+    app.kubernetes.io/name: alloy
+data:
+  config.river: |-
+    logging {
+      level = "info"
+    }
+
+    // -------------------------
+    // Loki output
+    // -------------------------
+    loki.write "default" {
+      endpoint {
+        url = "https://loki-gateway.xx.xx/loki/api/v1/push"
+
+        tls_config {
+          insecure_skip_verify = true
+        }
+      }
+    }
+
+    // -------------------------
+    // Kubernetes discovery
+    // -------------------------
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    // -------------------------
+    // Source: pod logs
+    // -------------------------
+    loki.source.kubernetes "pods" {
+      targets    = discovery.kubernetes.pods.targets
+      forward_to = [loki.process.pipeline.receiver]
+    }
+
+    // -------------------------
+    // Processing pipeline
+    // -------------------------
+    loki.process "pipeline" {
+
+      // Drop kube-system
+      stage.match {
+        selector = `{namespace="kube-system"}`
+        action   = "drop"
+      }
+
+      // High-volume namespace tuning (example)
+      stage.match {
+        selector = `{namespace="ingress-nginx"}`
+        action   = "keep"
+
+        stages = [
+          {
+            drop = {
+              expression = ".*kube-probe.*|.*GET /health.*|.*GET /ready.*|.*GET /live.*|.*GET /metrics.*"
+            }
+          }
+        ]
+      }
+
+      // Parse CRI
+      stage.cri {}
+
+      // Parse JSON logs
+      stage.json {
+        expressions = {
+          level     = "level"
+          logger    = "logger"
+          mdc       = "mdc"
+          message   = "message"
+          thread    = "thread"
+          timestamp = "timestamp"
+        }
+      }
+
+      // Drop INFO logs for ingress
+      stage.match {
+        selector = `{namespace="ingress-nginx", level="INFO"}`
+        action   = "drop"
+      }
+
+      // Labels (Promtail relabel equivalent)
+      stage.labels {
+        values = {
+          app       = "{{ .__meta_kubernetes_pod_label_app_kubernetes_io_name | default .__meta_kubernetes_pod_label_app | default .__meta_kubernetes_pod_name }}"
+          instance  = "{{ .__meta_kubernetes_pod_label_app_kubernetes_io_instance | default .__meta_kubernetes_pod_label_instance }}"
+          component = "{{ .__meta_kubernetes_pod_label_app_kubernetes_io_component | default .__meta_kubernetes_pod_label_component }}"
+          namespace = "{{ .__meta_kubernetes_namespace }}"
+          pod       = "{{ .__meta_kubernetes_pod_name }}"
+          container = "{{ .__meta_kubernetes_pod_container_name }}"
+        }
+      }
+
+      // job = namespace/app
+      stage.template {
+        source   = "job"
+        template = "{{ .namespace }}/{{ .app }}"
+      }
+
+      forward_to = [loki.write.default.receiver]
+    }
