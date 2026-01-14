@@ -1,0 +1,46 @@
+logging {
+  level = "info"
+}
+
+loki.write "default" {
+  endpoint {
+    url = "https://loki-gateway.xx.xx/loki/api/v1/push"
+    tls_config {
+      insecure_skip_verify = true
+    }
+  }
+}
+
+discovery.kubernetes "pods" {
+  role = "pod"
+}
+
+loki.source.kubernetes "pods" {
+  targets    = discovery.kubernetes.pods.targets
+  forward_to = [loki.process.pipeline.receiver]
+}
+
+loki.process "pipeline" {
+
+  stage.match {
+    selector = `{namespace="kube-system"}`
+    action   = "keep"
+  }
+
+  stage.match {
+    selector = `{namespace!="kube-system"}`
+    action   = "drop"
+  }
+
+  stage.cri {}
+
+  stage.labels {
+    values = {
+      namespace = "{{ .__meta_kubernetes_namespace }}"
+      pod       = "{{ .__meta_kubernetes_pod_name }}"
+      container = "{{ .__meta_kubernetes_pod_container_name }}"
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
